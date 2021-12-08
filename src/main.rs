@@ -1,0 +1,190 @@
+use core::time::Duration;
+use futures::{SinkExt, StreamExt, stream::SplitSink};
+use warp::filters::ws::{Message, WebSocket};
+use warp::Filter;
+
+use std::sync::Arc; 
+use tokio::sync::RwLock; 
+
+use std::collections::HashMap; 
+
+use serde::{Serialize, Deserialize}; 
+
+type NodeId = String;
+type ClientId = u128; 
+
+#[derive(Deserialize, Debug)]
+struct Subscription {
+    node_id: NodeId, 
+    unsubscribe: bool
+}
+
+#[derive(Serialize, Debug)] 
+struct NodeUpdate {
+    id: NodeId, 
+    data: Option<Data>, 
+    connections: Option<Connections>, 
+    active_roles: Option<ActiveRoles>
+}
+
+#[derive(Serialize, Debug)] 
+struct Data {
+    title: String, 
+    description: String
+}
+
+#[derive(Serialize, Debug)] 
+struct ActiveRoles {
+    roles: Vec<Role>
+}
+
+#[derive(Serialize, Debug)] 
+struct Role {
+    name: String, 
+    identity: String
+}
+
+#[derive(Serialize, Debug)] 
+struct Connections {
+    from: Vec<NodeId>, 
+    to: Vec<NodeId>
+}
+
+type Sender = SplitSink<WebSocket, Message>; 
+
+struct Subs {
+    by_nodes: HashMap<NodeId, Vec<ClientId>>, 
+    by_clients: HashMap<ClientId, Vec<NodeId>>,  
+    senders: HashMap<ClientId, Sender>, 
+    next_id: ClientId
+}
+
+impl Subs {
+    pub fn new() -> Self {
+        Self {
+            by_nodes: HashMap::new(), 
+            by_clients: HashMap::new(), 
+            senders: HashMap::new(), 
+            next_id: 0
+        }
+    }
+    pub fn add_client(&mut self, sender: Sender) -> ClientId {
+        let id = self.next_id; 
+        self.next_id += 1; 
+        self.senders.insert(id, sender); 
+        self.by_clients.insert(id, Vec::new()); 
+        id
+    }
+    pub fn unsubscribe(&mut self, client_id: ClientId, node_id: NodeId) {
+        match self.by_nodes.get_mut(&node_id) {
+            Some(loc) => {
+                loc.retain(|&i| i != client_id); 
+            }, 
+            None => ()
+        };
+
+        match self.by_clients.get_mut(&client_id) {
+            Some(lon) => {
+                lon.retain(|i| !i.eq(&node_id));
+            }, 
+            None => ()
+        }; 
+    }
+    pub fn subscribe(&mut self, client_id: ClientId, node_id: &NodeId) {
+        match self.by_nodes.get_mut(node_id) {
+            Some(loc) => {
+                loc.push(client_id); 
+            }, 
+            None => {
+                let loc : Vec<ClientId> = vec![client_id]; 
+                self.by_nodes.insert(node_id.into(), loc); 
+            }
+        };
+
+        match self.by_clients.get_mut(&client_id) {
+            Some(lon) => {
+                lon.push(node_id.into());
+            }, 
+            None => {
+                let lon : Vec<NodeId> = vec![node_id.into()]; 
+                self.by_clients.insert(client_id, lon); 
+            }
+        }; 
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let subs = Arc::new(RwLock::new(Subs::new())); 
+
+    let routes = warp::path("echo")
+        .and(warp::ws())
+        .map(move |ws: warp::ws::Ws| {
+            let subs_clone = subs.clone();
+            ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone.clone())) 
+        });
+
+    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+
+}
+
+async fn handle_ws_client(websocket: WebSocket, subs: Arc<RwLock<Subs>>) {
+    // Just echo all messages back...
+    let (mut sender, mut receiver) = websocket.split();
+
+    send_seven_summits(&mut sender).await;
+
+    let client_id = subs.write().await.add_client(sender); 
+
+    while let Some(body) = receiver.next().await {
+        let message = match body {
+            Ok(msg) => msg, 
+            Err(e) => {
+                println!("error reading msg on websocket: {}", e); 
+                break; 
+            }
+        }; 
+        handle_ws_message(message, subs.clone(), client_id).await; 
+    }
+
+    println!("client disconnected") 
+}
+
+async fn handle_ws_message(message: Message, subs: Arc<RwLock<Subs>>, client_id: ClientId) {
+    // Skip any non-Text messages...
+    let msg = if let Ok(s) = message.to_str() {
+        s
+    } else {
+        println!("ping-pong");
+        return;
+    };
+
+    let sub: Subscription = serde_json::from_str(msg).unwrap();
+    if sub.unsubscribe {
+        println!("client {} subscribing to node {}", client_id, sub.node_id);
+        subs.write().await.subscribe(client_id, &sub.node_id); 
+    } else {
+        println!("client {} unsubscribing from node {}", client_id, sub.node_id);
+        subs.write().await.unsubscribe(client_id, sub.node_id); 
+    }
+
+
+    std::thread::sleep(Duration::new(1, 0));
+}
+
+async fn send_seven_summits(sender: &mut Sender) {
+    let update = serde_json::to_string(&NodeUpdate {
+        id: "7s_1".to_string(), 
+        data: Some(Data {
+            title: "hey".to_string(), 
+            description: "descr".to_string() 
+        }), 
+        connections: Some(Connections {
+            from: vec!["7s_2".to_string()], 
+            to: vec![]
+        }), 
+        active_roles: None
+    })
+    .unwrap();
+    sender.send(Message::text(update)).await.unwrap();
+}
