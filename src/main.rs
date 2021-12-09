@@ -24,7 +24,15 @@ struct NodeUpdate {
     id: NodeId, 
     data: Option<Data>, 
     connections: Option<Connections>, 
-    active_roles: Option<ActiveRoles>
+    roles: Option<ActiveRoles>, 
+    geometry: Option<Geometry>
+}
+
+#[derive(Serialize, Debug)] 
+struct Geometry{
+    x: f64, 
+    y: f64, 
+    r: f64
 }
 
 #[derive(Serialize, Debug)] 
@@ -44,11 +52,20 @@ struct Role {
     identity: String
 }
 
+type Connection = (NodeId, ConnectionFeatures); 
+
 #[derive(Serialize, Debug)] 
 struct Connections {
-    from: Vec<NodeId>, 
-    to: Vec<NodeId>
+    from: Vec<Connection>, 
+    to: Vec<Connection>
 }
+
+#[derive(Serialize, Debug)] 
+struct ConnectionFeatures {
+    value: f64
+}
+
+
 
 type Sender = SplitSink<WebSocket, Message>; 
 
@@ -117,19 +134,21 @@ impl Subs {
 async fn main() {
     let subs = Arc::new(RwLock::new(Subs::new())); 
 
-    let routes = warp::path("echo")
-        .and(warp::ws())
+    let routes = warp::path("v1")
+        .and(warp::ws()) 
         .map(move |ws: warp::ws::Ws| {
             let subs_clone = subs.clone();
             ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone.clone())) 
         });
 
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
-
+    const PORT :u16 = 3030; 
+    println!("about to serve on port {}", PORT); 
+    warp::serve(routes).run(([127, 0, 0, 1], PORT)).await;
 }
 
 async fn handle_ws_client(websocket: WebSocket, subs: Arc<RwLock<Subs>>) {
-    // Just echo all messages back...
+    println!("client connecting");
+
     let (mut sender, mut receiver) = websocket.split();
 
     send_seven_summits(&mut sender).await;
@@ -137,6 +156,7 @@ async fn handle_ws_client(websocket: WebSocket, subs: Arc<RwLock<Subs>>) {
     let client_id = subs.write().await.add_client(sender); 
 
     while let Some(body) = receiver.next().await {
+
         let message = match body {
             Ok(msg) => msg, 
             Err(e) => {
@@ -152,6 +172,7 @@ async fn handle_ws_client(websocket: WebSocket, subs: Arc<RwLock<Subs>>) {
 
 async fn handle_ws_message(message: Message, subs: Arc<RwLock<Subs>>, client_id: ClientId) {
     // Skip any non-Text messages...
+    println!("received message: {:?}", message);
     let msg = if let Ok(s) = message.to_str() {
         s
     } else {
@@ -173,18 +194,31 @@ async fn handle_ws_message(message: Message, subs: Arc<RwLock<Subs>>, client_id:
 }
 
 async fn send_seven_summits(sender: &mut Sender) {
-    let update = serde_json::to_string(&NodeUpdate {
-        id: "7s_1".to_string(), 
-        data: Some(Data {
-            title: "hey".to_string(), 
-            description: "descr".to_string() 
-        }), 
-        connections: Some(Connections {
-            from: vec!["7s_2".to_string()], 
-            to: vec![]
-        }), 
-        active_roles: None
-    })
-    .unwrap();
-    sender.send(Message::text(update)).await.unwrap();
+    for n in 0..7 {
+        let v = 2.0 * 3.1415 / 7.0 * (n as f64); 
+        let update = serde_json::to_string(&NodeUpdate {
+            id: format!("summit{}", n), 
+            data: Some(Data {
+                title: format!("summit {}", n), 
+                description: "descr".to_string()
+            }), 
+            connections: Some(Connections {
+                from: vec![(
+                    format!("summit{}", (n + 1) % 7), 
+                    ConnectionFeatures {
+                        value: 1.0
+                    }
+                )], 
+                to: vec![]
+            }), 
+            roles: None, 
+            geometry: Some(Geometry {
+                x: v.sin() * 3.0, 
+                y: v.cos() * 3.0,
+                r: 1.0
+            })
+        })
+        .unwrap();
+        sender.send(Message::text(update)).await.unwrap();
+    }
 }
