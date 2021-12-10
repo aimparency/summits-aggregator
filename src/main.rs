@@ -1,4 +1,5 @@
 use core::time::Duration;
+use std::f64;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use warp::filters::ws::{Message, WebSocket};
 use warp::Filter;
@@ -52,20 +53,18 @@ struct Role {
     identity: String
 }
 
-type Connection = (NodeId, ConnectionFeatures); 
-
 #[derive(Serialize, Debug)] 
-struct Connections {
-    from: Vec<Connection>, 
-    to: Vec<Connection>
-}
-
-#[derive(Serialize, Debug)] 
-struct ConnectionFeatures {
+struct Connection {
+    from: NodeId, 
+    to: NodeId, 
     value: f64
 }
 
-
+#[derive(Serialize, Debug)] 
+struct Connections {
+    from: HashMap<NodeId, Connection>, 
+    to: HashMap<NodeId, Connection>
+}
 
 type Sender = SplitSink<WebSocket, Message>; 
 
@@ -189,7 +188,6 @@ async fn handle_ws_message(message: Message, subs: Arc<RwLock<Subs>>, client_id:
         subs.write().await.unsubscribe(client_id, sub.node_id); 
     }
 
-
     std::thread::sleep(Duration::new(1, 0));
 }
 
@@ -202,19 +200,26 @@ async fn send_seven_summits(sender: &mut Sender) {
                 title: format!("summit {}", n), 
                 description: "descr".to_string()
             }), 
-            connections: Some(Connections {
-                from: vec![(
-                    format!("summit{}", (n + 1) % 7), 
-                    ConnectionFeatures {
-                        value: 1.0
-                    }
-                )], 
-                to: vec![]
+            connections: Some( Connections {
+                from: HashMap::from([
+                    (format!("summit{}", (n + 7 - 1) % 7), Connection {
+                        from: format!("summit{}", (n + 7 - 1) % 7),
+                        to: format!("summit{}", n), 
+                        value: 0.5
+                    })
+                ]), 
+                to: HashMap::from([
+                    (format!("summit{}", (n + 1) % 7), Connection {
+                        from: format!("summit{}", n),
+                        to: format!("summit{}", (n + 1) % 7 ), 
+                        value: 0.5
+                    })
+                ]), 
             }), 
             roles: None, 
             geometry: Some(Geometry {
-                x: v.sin() * 3.0, 
-                y: v.cos() * 3.0,
+                x: v.sin() * 6.0, 
+                y: v.cos() * 6.0,
                 r: 1.0
             })
         })
