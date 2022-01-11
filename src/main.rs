@@ -1,3 +1,9 @@
+/** This is a server for summits. 
+ * It allows for subscribing for 
+ *  - summit-ids and 
+ *  - connections
+ */
+
 use core::time::Duration;
 use std::f64;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
@@ -6,73 +12,109 @@ use warp::Filter;
 
 use std::sync::Arc; 
 use tokio::sync::RwLock; 
+use tokio::sync::Mutex; 
 
 use std::collections::HashMap; 
 
 use serde::{Serialize, Deserialize}; 
 
-type NodeId = String;
+#[macro_use]
+extern crate diesel; 
+use dotenv; 
+
+pub mod schema; 
+pub mod models; 
+
+use models::*;
+
+use diesel::prelude::*; 
+use diesel::pg::PgConnection;
+use std::env; 
+
 type ClientId = u128; 
 
 #[derive(Deserialize, Debug)]
-struct Subscription {
-    node_id: NodeId, 
-    unsubscribe: bool
+enum IncomingMessage {
+    Subscription(NodeSubscriptionMessage), 
+    Desubscription(NodeDesubscriptionMessage)
+}
+
+#[derive(Deserialize, Debug)]
+struct NodeSubscriptionMessage {
+    node_id: NodeId
+}
+
+#[derive(Deserialize, Debug)]
+struct NodeDesubscriptionMessage {
+    node_id: NodeId
+}
+
+// #[derive(Deserialize, Debug)]
+// struct ConnectionSubscriptionMessage {
+//     from: NodeId, 
+//     to: NodeId, 
+//     unsubscribe: bool
+// }
+
+#[derive(Serialize, Debug)] 
+struct InitMessage {
+    node_ids: Vec<NodeId>
 }
 
 #[derive(Serialize, Debug)] 
-struct NodeUpdate {
+struct NodeUpdateMessage {
     id: NodeId, 
-    data: Option<Data>, 
-    connections: Option<Connections>, 
-    roles: Option<ActiveRoles>, 
-    geometry: Option<Geometry>
+    data: Option<NodeData>, 
+    connections: Option<NodeConnections>, 
+    roles: Option<NodeRoles>, 
+    geometry: Option<NodeGeometry>
 }
 
 #[derive(Serialize, Debug)] 
-struct Geometry{
-    x: f64, 
+struct ConnectionUpdateMessage {
+    from: NodeId, 
+    to: NodeId, 
+    notes: Option<String>, 
+    share: Option<f32>
+}
+
+#[derive(Serialize, Debug)] 
+struct NodeGeometry{
+    x: f64, // is there a derive, that makes everything an Option? Apply to all node field structs
     y: f64, 
     r: f64
 }
 
 #[derive(Serialize, Debug)] 
-struct Data {
+struct NodeData {
     title: String, 
-    description: String
+    notes: String
 }
 
 #[derive(Serialize, Debug)] 
-struct ActiveRoles {
-    roles: Vec<Role>
+struct NodeRoles {
+    roles: Vec<NodeRole>
 }
 
 #[derive(Serialize, Debug)] 
-struct Role {
+struct NodeRole {
     name: String, 
     identity: String
 }
 
 #[derive(Serialize, Debug)] 
-struct Connection {
-    from: NodeId, 
-    to: NodeId, 
-    value: f64
+struct NodeConnections {
+    from: Vec<NodeId>, 
+    to: Vec<NodeId>
 }
 
-#[derive(Serialize, Debug)] 
-struct Connections {
-    from: HashMap<NodeId, Connection>, 
-    to: HashMap<NodeId, Connection>
-}
-
-type Sender = SplitSink<WebSocket, Message>; 
+type Client = SplitSink<WebSocket, Message>; 
 
 struct Subs {
     by_nodes: HashMap<NodeId, Vec<ClientId>>, 
     by_clients: HashMap<ClientId, Vec<NodeId>>,  
-    senders: HashMap<ClientId, Sender>, 
-    next_id: ClientId
+    clients: HashMap<ClientId, Client>, 
+    next_client_id: ClientId
 }
 
 impl Subs {
@@ -80,14 +122,14 @@ impl Subs {
         Self {
             by_nodes: HashMap::new(), 
             by_clients: HashMap::new(), 
-            senders: HashMap::new(), 
-            next_id: 0
+            clients: HashMap::new(), 
+            next_client_id: 0
         }
     }
-    pub fn add_client(&mut self, sender: Sender) -> ClientId {
-        let id = self.next_id; 
-        self.next_id += 1; 
-        self.senders.insert(id, sender); 
+    pub fn add_client(&mut self, sender: Client) -> ClientId {
+        let id = self.next_client_id; 
+        self.next_client_id += 1; 
+        self.clients.insert(id, sender); 
         self.by_clients.insert(id, Vec::new()); 
         id
     }
@@ -106,38 +148,50 @@ impl Subs {
             None => ()
         }; 
     }
-    pub fn subscribe(&mut self, client_id: ClientId, node_id: &NodeId) {
-        match self.by_nodes.get_mut(node_id) {
+    pub fn subscribe(&mut self, client_id: ClientId, node_id: NodeId) {
+        match self.by_nodes.get_mut(&node_id) {
             Some(loc) => {
                 loc.push(client_id); 
             }, 
             None => {
                 let loc : Vec<ClientId> = vec![client_id]; 
-                self.by_nodes.insert(node_id.into(), loc); 
+                self.by_nodes.insert(node_id, loc); 
             }
         };
 
         match self.by_clients.get_mut(&client_id) {
             Some(lon) => {
-                lon.push(node_id.into());
+                lon.push(node_id);
             }, 
             None => {
-                let lon : Vec<NodeId> = vec![node_id.into()]; 
+                let lon : Vec<NodeId> = vec![node_id]; 
                 self.by_clients.insert(client_id, lon); 
             }
         }; 
     }
 }
 
+
+
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().ok(); 
+
+    println!("establishing connection to db"); 
+    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env");
+    let db_error = format!("Error connecting to {}", db_url); 
+    let db_connection = Arc::new(Mutex::new(
+        PgConnection::establish(&db_url).expect(&db_error)
+    ));
+
     let subs = Arc::new(RwLock::new(Subs::new())); 
 
     let routes = warp::path("v1")
         .and(warp::ws()) 
         .map(move |ws: warp::ws::Ws| {
             let subs_clone = subs.clone();
-            ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone.clone())) 
+            let db_connection_clone = db_connection.clone();
+            ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone, db_connection_clone)) 
         });
 
     const PORT :u16 = 3030; 
@@ -145,7 +199,11 @@ async fn main() {
     warp::serve(routes).run(([127, 0, 0, 1], PORT)).await;
 }
 
-async fn handle_ws_client(websocket: WebSocket, subs: Arc<RwLock<Subs>>) {
+async fn handle_ws_client(
+    websocket: WebSocket, 
+    subs: Arc<RwLock<Subs>>, 
+    db_connection: Arc<Mutex<PgConnection>>
+) {
     println!("client connecting");
 
     let (mut sender, mut receiver) = websocket.split();
@@ -155,7 +213,6 @@ async fn handle_ws_client(websocket: WebSocket, subs: Arc<RwLock<Subs>>) {
     let client_id = subs.write().await.add_client(sender); 
 
     while let Some(body) = receiver.next().await {
-
         let message = match body {
             Ok(msg) => msg, 
             Err(e) => {
@@ -163,67 +220,90 @@ async fn handle_ws_client(websocket: WebSocket, subs: Arc<RwLock<Subs>>) {
                 break; 
             }
         }; 
-        handle_ws_message(message, subs.clone(), client_id).await; 
+        handle_ws_message(message, subs.clone(), db_connection.clone(), client_id).await; 
     }
 
     println!("client disconnected") 
 }
 
-async fn handle_ws_message(message: Message, subs: Arc<RwLock<Subs>>, client_id: ClientId) {
-    // Skip any non-Text messages...
-    println!("received message: {:?}", message);
+async fn handle_ws_message(
+    message: Message, 
+    subs: Arc<RwLock<Subs>>, 
+    db_connection: Arc<Mutex<PgConnection>>,
+    client_id: ClientId
+) {
     let msg = if let Ok(s) = message.to_str() {
         s
     } else {
-        println!("ping-pong");
+        println!("not a string message");
         return;
     };
 
-    let sub: Subscription = serde_json::from_str(msg).unwrap();
-    if sub.unsubscribe {
-        println!("client {} subscribing to node {}", client_id, sub.node_id);
-        subs.write().await.subscribe(client_id, &sub.node_id); 
-    } else {
-        println!("client {} unsubscribing from node {}", client_id, sub.node_id);
-        subs.write().await.unsubscribe(client_id, sub.node_id); 
+    match serde_json::from_str(msg) {
+        Ok(incoming_message) => { 
+            handle_message(incoming_message, &subs, db_connection, client_id).await
+        }, 
+        Err(err) => {
+            println!("failed to json-parse message. {} {}", msg, err)
+        }
     }
 
     std::thread::sleep(Duration::new(1, 0));
 }
 
-async fn send_seven_summits(sender: &mut Sender) {
-    for n in 0..7 {
-        let v = 2.0 * 3.1415 / 7.0 * (n as f64); 
-        let update = serde_json::to_string(&NodeUpdate {
-            id: format!("summit{}", n), 
-            data: Some(Data {
-                title: format!("summit {}", n), 
-                description: "descr".to_string()
-            }), 
-            connections: Some( Connections {
-                from: HashMap::from([
-                    (format!("summit{}", (n + 7 - 1) % 7), Connection {
-                        from: format!("summit{}", (n + 7 - 1) % 7),
-                        to: format!("summit{}", n), 
-                        value: 0.5
-                    })
-                ]), 
-                to: HashMap::from([
-                    (format!("summit{}", (n + 1) % 7), Connection {
-                        from: format!("summit{}", n),
-                        to: format!("summit{}", (n + 1) % 7 ), 
-                        value: 0.5
-                    })
-                ]), 
-            }), 
-            roles: None, 
-            geometry: Some(Geometry {
-                x: v.sin() * 6.0, 
-                y: v.cos() * 6.0,
-                r: 1.0
-            })
-        })
-        .unwrap();
-        sender.send(Message::text(update)).await.unwrap();
+async fn handle_message(
+    msg: IncomingMessage,
+    subs: &Arc<RwLock<Subs>>,
+    db_connection: Arc<Mutex<PgConnection>>,
+    client_id: ClientId
+) {
+    match msg { 
+        IncomingMessage::Subscription(sub) => {
+            println!("client {} subscribing to node {}", client_id, sub.node_id);
+            subs.write().await.subscribe(client_id, sub.node_id); 
+            initial_update(client_id, db_connection, sub.node_id).await;
+        }, 
+        IncomingMessage::Desubscription(desub) => {
+            println!("client {} unsubscribing from node {}", client_id, desub.node_id);
+            subs.write().await.unsubscribe(client_id, desub.node_id); 
+        }
     }
+}
+
+async fn initial_update(
+    client_id: ClientId, 
+    db_connection: Arc<Mutex<PgConnection>>,
+    node_id: NodeId
+) {
+    use schema::nodes::dsl::*; 
+
+    let result = nodes.find(node_id)
+        .first::<Node>(&*db_connection.lock().await);
+
+    match result {
+        Ok(node) => {
+            println!("{}", node.title); 
+        }, 
+        Err(err) => {
+            println!("could not find node {} in db. {}", node_id, err)
+        }
+    }
+
+    // use some database to get node
+    // get node neighbors
+    // get client node subscriptions
+    // union(node neighbors, client node subscriptions) 
+    // send node_update 
+    // send connectionUpdates
+}
+
+async fn send_seven_summits(sender: &mut Client) {
+    let node_ids = vec![]; 
+
+    let message = InitMessage {
+        node_ids
+    }; 
+
+    let message_string = serde_json::to_string(&message).unwrap(); 
+    sender.send(Message::text(message_string)).await.unwrap();
 }
