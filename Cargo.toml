@@ -17,3 +17,4 @@ uuid = {version = "0.8.2", features = ["serde"]}
 warp = "0.3.2"
 diesel = { version = "1.4.4", features = ["postgres", "uuidv07"] }
 dotenv = "0.15.0"
+serde_with = "1.11.0"

@@ -1,3 +1,3 @@
 DROP TABLE nodes; 
 
-DROP TABLE connections; 
+DROP TABLE flows; 

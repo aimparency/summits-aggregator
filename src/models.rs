@@ -11,9 +11,9 @@ pub struct Node {
 }
 
 #[derive(Queryable)]
-pub struct Connection {
-    pub from_node: NodeId, 
-    pub to_node: NodeId, 
+pub struct Flow {
+    pub from_id: NodeId, 
+    pub into_id: NodeId, 
     pub notes: String, 
-    pub flow: f32
+    pub share: f32
 }

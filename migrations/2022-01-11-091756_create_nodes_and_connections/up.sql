@@ -4,11 +4,11 @@ CREATE TABLE nodes (
 	notes VARCHAR NOT NULL
 );
 
-CREATE TABLE connections (
-	from_node UUID,
-	to_node	UUID,
+CREATE TABLE flows (
+	from_id UUID,
+	into_id UUID,
 	notes VARCHAR NOT NULL, 
-	flow REAL NOT NULL, 
-	PRIMARY KEY (from_node, to_node) 
+	share REAL NOT NULL, 
+	PRIMARY KEY (from_id, into_id) 
 );
 
