@@ -91,8 +91,10 @@ struct NodeUpdateMessage {
     // y: Option<f64>, 
     // r: Option<f64>
     // flows
-    flows_from: Option<Vec<NodeId>>, 
-    flows_into: Option<Vec<NodeId>>
+    // flows_from: Option<Vec<NodeId>>, 
+    // flows_into: Option<Vec<NodeId>>, 
+    // flows_from_additions: Option<Vec<NodeId>>, 
+    // flows_into_additions: Option<Vec<NodeId>>
     // roles
     // roles: Option<Vec<NodeRole>>
 }
@@ -111,7 +113,7 @@ type Client = SplitSink<WebSocket, Message>;
 struct Subs {
     by_nodes: HashMap<NodeId, Vec<ClientId>>, 
     by_clients: HashMap<ClientId, Vec<NodeId>>,  
-    clients: HashMap<ClientId, Client>, 
+    clients: HashMap<ClientId, Arc<Mutex<Client>>>, 
     next_client_id: ClientId
 }
 
@@ -127,7 +129,7 @@ impl Subs {
     pub fn add_client(&mut self, sender: Client) -> ClientId {
         let id = self.next_client_id; 
         self.next_client_id += 1; 
-        self.clients.insert(id, sender); 
+        self.clients.insert(id, Arc::new(Mutex::new(sender)));
         self.by_clients.insert(id, Vec::new()); 
         id
     }
@@ -167,15 +169,45 @@ impl Subs {
             }
         }; 
     }
-    pub fn get_client_subscription_node_ids(
-        &self, 
-        client_id: ClientId
-    ) -> Option<&Vec<NodeId>> 
-    {
-        self.by_clients.get(&client_id)
+    pub fn get_clients_by_ids(&self, client_ids: Vec<ClientId>) -> Vec<Arc<Mutex<Client>>> {
+        let mut clients = vec![]; 
+        for client_id in client_ids {
+            match self.clients.get(&client_id) {
+                Some(client) => clients.push(client.clone()), 
+                None => ()
+            }
+        }
+        clients
     }
-    pub fn get_client(&mut self, client_id: ClientId) -> Option<&mut Client> {
-        self.clients.get_mut(&client_id) 
+    pub fn get_client_ids_by_node_id(&self, node_id: NodeId) -> Vec<ClientId> {
+        match self.by_nodes.get(&node_id) {
+            Some(client_ids) => client_ids.clone(), 
+            None => vec![]
+        }
+    }
+    pub fn get_clients_by_node_id(
+        &self, 
+        node_id: NodeId
+    ) -> Vec<Arc<Mutex<Client>>> {
+        match self.by_nodes.get(&node_id) {
+            Some(client_ids) => {
+                let mut clients = vec![]; 
+                for client_id in client_ids {
+                    match self.clients.get(&client_id) {
+                        Some(client) => clients.push(client.clone()), 
+                        None => ()
+                    }
+                }
+                clients
+            }, 
+            None => vec![]
+        }
+    }
+    pub fn get_client(&self, client_id: ClientId) -> Option<Arc<Mutex<Client>>> {
+        match self.clients.get(&client_id) {
+            Some(client) => Some(client.clone()), 
+            None => None
+        }
     }
 }
 
@@ -269,7 +301,9 @@ async fn handle_message(
         IncomingMessage::NodeSubscription(sub) => {
             println!("client {} subscribing to node {}", client_id, sub.node_id);
             subs.write().await.subscribe(client_id, sub.node_id); 
+            // lock client
             initial_update(client_id, db_connection, sub.node_id, subs.clone()).await;
+            // release client
         }, 
         IncomingMessage::NodeDesubscription(desub) => {
             println!("client {} unsubscribing from node {}", client_id, desub.node_id);
@@ -277,34 +311,150 @@ async fn handle_message(
         }, 
         IncomingMessage::NodeCreation(node_creation) => {
             println!("client {} creating node", client_id); 
-            use schema::nodes::dsl::*; 
-
-            let new_node = (
-                id.eq(node_creation.id),
-                title.eq(node_creation.title),
-                notes.eq(node_creation.notes)
-            ); 
-            
-            diesel::insert_into(nodes)
-                .values(&new_node)
-                .execute(&*db_connection.lock().await)
-                .unwrap(); 
-        }, 
+            create_node(node_creation, subs, db_connection).await;
+        },        
         IncomingMessage::FlowCreation(flow_creation) => {
             println!("client {} creating flow", client_id); 
-            use schema::flows::dsl::*; 
+            create_flow(flow_creation, subs, db_connection).await; 
+        }
+    }
+}
 
-            let new_flow = (
-                from_id.eq(flow_creation.from_id),
-                into_id.eq(flow_creation.into_id),
-                notes.eq(flow_creation.notes), 
-                share.eq(flow_creation.share)
-            ); 
-            
-            diesel::insert_into(flows)
-                .values(&new_flow)
-                .execute(&*db_connection.lock().await)
-                .unwrap(); 
+async fn create_node(
+    node_creation: NodeCreationMessage,
+    subs: Arc<RwLock<Subs>>,
+    db_connection: Arc<Mutex<PgConnection>>,
+) {
+    use schema::nodes::dsl::*; 
+
+    let new_node = (
+        id.eq(node_creation.id),
+        title.eq(node_creation.title.clone()),
+        notes.eq(node_creation.notes.clone())
+    ); 
+    
+    diesel::insert_into(nodes)
+        .values(&new_node)
+        .execute(&*db_connection.lock().await)
+        .unwrap(); 
+
+    let subs_w = subs.read().await; 
+
+    let clients = subs_w.get_clients_by_node_id(node_creation.id); 
+
+    for c in clients {
+        let msg = OutgoingMessage::NodeUpdate(NodeUpdateMessage { 
+            id: node_creation.id, 
+            title: Some(node_creation.title.clone()), 
+            notes: Some(node_creation.notes.clone()), 
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+
+        c.lock().await.send(Message::text(json)).await.unwrap();
+    }
+}
+
+async fn create_flow(
+    flow_creation: FlowCreationMessage,
+    subs: Arc<RwLock<Subs>>,
+    db_connection: Arc<Mutex<PgConnection>>,
+) {
+    use schema::flows::dsl::*; 
+
+    let new_flow = (
+        from_id.eq(flow_creation.from_id),
+        into_id.eq(flow_creation.into_id),
+        notes.eq(flow_creation.notes.clone()), 
+        share.eq(flow_creation.share)
+    ); 
+
+    let result = diesel::insert_into(flows)
+        .values(&new_flow)
+        .execute(&*db_connection.lock().await); 
+
+    match result {
+        Ok(..) => {
+            send_create_flow_updates(
+                flow_creation, 
+                subs, 
+            ).await
+        }, 
+        Err(err) => {
+            println!("DB error when creating flow {}", err)
+        }
+    };
+}
+
+async fn send_create_flow_updates(
+    flow_creation: FlowCreationMessage, 
+    subs: Arc<RwLock<Subs>>
+) {
+    let subs_w = subs.read().await; 
+    
+    // send node update. Maybe onlye send connection update to everybody and let client handle it
+    // let from_node_clients = subs_w.get_clients_by_ids(from_node_client_ids.clone());
+    // for c in from_node_clients {
+    //     let msg = OutgoingMessage::NodeUpdate(NodeUpdateMessage { 
+    //         id: flow_creation.from_id, 
+    //         title: None, 
+    //         notes: None, 
+    //         flows_from: None, 
+    //         flows_into_additions: Some(vec![flow_creation.into_id]), 
+    //         flows_into: None, 
+    //         flows_from_additions: None
+    //     });
+    //     let json = serde_json::to_string(&msg).unwrap();
+
+    //     c.lock().await.send(Message::text(json)).await.unwrap();
+    // }
+
+    // send node update. Maybe only send connection update...
+    // let into_node_clients = subs_w.get_clients_by_ids(into_node_client_ids.clone()); 
+    // for c in into_node_clients {
+    //     let msg = OutgoingMessage::NodeUpdate(NodeUpdateMessage { 
+    //         id: flow_creation.into_id, 
+    //         title: None, 
+    //         notes: None, 
+    //         flows_from: None, 
+    //         flows_from_additions: Some(vec![flow_creation.from_id]), 
+    //         flows_into: None, 
+    //         flows_into_additions: None
+    //     });
+    //     let json = serde_json::to_string(&msg).unwrap();
+
+    //     c.lock().await.send(Message::text(json)).await.unwrap();
+    // }
+    
+    let from_node_client_ids = subs_w.get_client_ids_by_node_id(flow_creation.from_id); 
+    let into_node_client_ids = subs_w.get_client_ids_by_node_id(flow_creation.into_id); 
+
+    let flow_client_ids = from_node_client_ids.into_iter().filter(|client_id| {
+        for i in into_node_client_ids.iter() {
+            if i.eq(client_id) {
+                return false
+            } 
+        }
+        true
+    }).chain(into_node_client_ids.clone().into_iter()).collect();
+
+    let flow_clients = subs_w.get_clients_by_ids(flow_client_ids); 
+
+    for c in flow_clients {
+        let msg = OutgoingMessage::FlowUpdate(FlowUpdateMessage { 
+            from_id: flow_creation.from_id, 
+            into_id: flow_creation.into_id, 
+            notes: Some(flow_creation.notes.clone()), 
+            share: Some(flow_creation.share)
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+
+        match c.lock().await.send(Message::text(json)).await {
+            Ok(..) => (), 
+            Err(..) => {
+                // remove this client, its connection is probably closed
+                // add this client to a list of to be cleaned clients
+                ()
+            }
         }
     }
 }
@@ -329,45 +479,20 @@ async fn initial_update(
             let flows_from = flows.filter(into_id.eq(node_id))
                 .load::<Flow>(&*db_connection.lock().await).unwrap(); 
             
-            let flows_into_ids = flows_into.iter().map(|f| f.into_id).collect(); 
-            let flows_from_ids = flows_from.iter().map(|f| f.from_id).collect();
-
-            let mut subs_w = subs.write().await; 
+            let subs_w = subs.read().await; 
             
-            let node_subs = subs_w.get_client_subscription_node_ids(client_id).unwrap().clone(); 
-
-            let flow_updates = flows_from.iter()
-            .filter(|f| {
-                for i in node_subs.iter() {
-                    if *i == f.from_id {
-                        return true
-                    } 
-                }
-                return false
-            })
-            .chain(flows_into.iter()
-                .filter(|f| {
-                    for i in node_subs.iter() {
-                        if *i == f.into_id {
-                            return true
-                        }
-                    }
-                    return false
-                })
-            );
+            let flow_updates = flows_from.iter().chain(flows_into.iter()); 
 
             match subs_w.get_client(client_id) {
                 Some(c) => {
                     let msg = OutgoingMessage::NodeUpdate(NodeUpdateMessage {
                         id: node.id, 
                         title: Some(node.title), 
-                        notes: Some(node.notes), 
-                        flows_into: Some(flows_into_ids), 
-                        flows_from: Some(flows_from_ids)
+                        notes: Some(node.notes),
                     });
                     let json = serde_json::to_string(&msg).unwrap();
 
-                    c.send(Message::text(json)).await.unwrap();
+                    c.lock().await.send(Message::text(json)).await.unwrap();
 
                     for flow in flow_updates {
                         let msg = OutgoingMessage::FlowUpdate(FlowUpdateMessage {
@@ -377,7 +502,7 @@ async fn initial_update(
                             share: Some(flow.share)
                         }); 
                         let txt = serde_json::to_string(&msg).unwrap();
-                        c.send(Message::text(txt)).await.unwrap();
+                        c.lock().await.send(Message::text(txt)).await.unwrap();
                     }
                 }, 
                 None => {
@@ -387,7 +512,7 @@ async fn initial_update(
 
         }, 
         Err(err) => {
-            println!("could not find node {} in db: {}", node_id, err)
+            println!("could not find node {} in db: {}", node_id, err); 
         }
     }
 }
