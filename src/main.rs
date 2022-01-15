@@ -38,7 +38,8 @@ enum IncomingMessage {
     NodeSubscription(NodeSubscriptionMessage), 
     NodeDesubscription(NodeDesubscriptionMessage)
     ,// temporary (mocking all the blockchain stuff away) 
-    NodeCreation(NodeCreationMessage)
+    NodeCreation(NodeCreationMessage), 
+    FlowCreation(FlowCreationMessage)
 }
 
 #[derive(Deserialize, Debug)]
@@ -56,6 +57,14 @@ struct NodeCreationMessage {
     id: NodeId, 
     title: String, 
     notes: String
+}
+
+#[derive(Deserialize, Debug)]
+struct FlowCreationMessage {
+    from_id: NodeId, 
+    into_id: NodeId, 
+    notes: String, 
+    share: f32
 }
 
 #[derive(Serialize, Debug)] 
@@ -91,8 +100,8 @@ struct NodeUpdateMessage {
 #[skip_serializing_none]
 #[derive(Serialize, Debug)] 
 struct FlowUpdateMessage {
-    from: NodeId, 
-    into: NodeId, 
+    from_id: NodeId, 
+    into_id: NodeId, 
     notes: Option<String>, 
     share: Option<f32>
 }
@@ -280,6 +289,22 @@ async fn handle_message(
                 .values(&new_node)
                 .execute(&*db_connection.lock().await)
                 .unwrap(); 
+        }, 
+        IncomingMessage::FlowCreation(flow_creation) => {
+            println!("client {} creating flow", client_id); 
+            use schema::flows::dsl::*; 
+
+            let new_flow = (
+                from_id.eq(flow_creation.from_id),
+                into_id.eq(flow_creation.into_id),
+                notes.eq(flow_creation.notes), 
+                share.eq(flow_creation.share)
+            ); 
+            
+            diesel::insert_into(flows)
+                .values(&new_flow)
+                .execute(&*db_connection.lock().await)
+                .unwrap(); 
         }
     }
 }
@@ -346,8 +371,8 @@ async fn initial_update(
 
                     for flow in flow_updates {
                         let msg = OutgoingMessage::FlowUpdate(FlowUpdateMessage {
-                            from: flow.from_id, 
-                            into: flow.into_id, 
+                            from_id: flow.from_id, 
+                            into_id: flow.into_id, 
                             notes: Some(flow.notes.clone()), 
                             share: Some(flow.share)
                         }); 
