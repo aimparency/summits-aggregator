@@ -4,8 +4,9 @@
  *  - connections
  */
 
-use core::time::Duration;
-use futures::{SinkExt, StreamExt, stream::SplitSink};
+use futures; 
+use futures::{future, SinkExt, StreamExt, stream::SplitSink};
+
 use warp::filters::ws::{Message, WebSocket};
 use warp::Filter;
 
@@ -29,6 +30,9 @@ use models::*;
 
 use diesel::prelude::*; 
 use diesel::pg::PgConnection;
+
+use diesel::r2d2::{self, ConnectionManager}; 
+
 use std::env; 
 
 type ClientId = u128; 
@@ -36,10 +40,12 @@ type ClientId = u128;
 #[derive(Deserialize, Debug)]
 enum IncomingMessage {
     NodeSubscription(NodeSubscriptionMessage), 
-    NodeDesubscription(NodeDesubscriptionMessage)
-    ,// temporary (mocking all the blockchain stuff away) 
+    NodeDesubscription(NodeDesubscriptionMessage), 
+    // temporary (mocking all the blockchain stuff away) 
     NodeCreation(NodeCreationMessage), 
-    FlowCreation(FlowCreationMessage)
+    FlowCreation(FlowCreationMessage), 
+    // bidirectional
+    NodeRemoval(NodeRemovalMessage)
 }
 
 #[derive(Deserialize, Debug)]
@@ -67,11 +73,17 @@ struct FlowCreationMessage {
     share: f32
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+struct NodeRemovalMessage {
+    node_id: NodeId
+}
+
 #[derive(Serialize, Debug)] 
 enum OutgoingMessage {
     SevenSummits(SevenSummitsMessage),
     NodeUpdate(NodeUpdateMessage), 
     FlowUpdate(FlowUpdateMessage), 
+    NodeRemoval(NodeRemovalMessage),
 }
 
 #[derive(Serialize, Debug)] 
@@ -140,13 +152,28 @@ impl Subs {
             }, 
             None => ()
         };
-
         match self.by_clients.get_mut(&client_id) {
             Some(lon) => {
                 lon.retain(|i| !i.eq(&node_id));
             }, 
             None => ()
         }; 
+    }
+    pub fn unsubscribe_all_from_node(&mut self, node_id: NodeId) {
+        match self.by_nodes.get_mut(&node_id) {
+            Some(client_ids) => {
+                for client_id in client_ids {
+                    match self.by_clients.get_mut(&client_id) {
+                        Some(node_ids) => {
+                            node_ids.retain(|i| !i.eq(&node_id))
+                        }, 
+                        None => ()
+                    } 
+                }
+            }, 
+            None => ()
+        }
+        self.by_nodes.remove(&node_id);
     }
     pub fn subscribe(&mut self, client_id: ClientId, node_id: NodeId) {
         match self.by_nodes.get_mut(&node_id) {
@@ -158,7 +185,6 @@ impl Subs {
                 self.by_nodes.insert(node_id, loc); 
             }
         };
-
         match self.by_clients.get_mut(&client_id) {
             Some(lon) => {
                 lon.push(node_id);
@@ -211,7 +237,7 @@ impl Subs {
     }
 }
 
-
+type DbPool = Arc<r2d2::Pool<ConnectionManager<PgConnection>>>;
 
 #[tokio::main]
 async fn main() {
@@ -219,10 +245,8 @@ async fn main() {
 
     println!("establishing connection to db"); 
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env");
-    let db_error = format!("Error connecting to {}", db_url); 
-    let db_connection = Arc::new(Mutex::new(
-        PgConnection::establish(&db_url).expect(&db_error)
-    ));
+    let db_manager = ConnectionManager::<PgConnection>::new(&db_url);
+    let db_pool = Arc::new(r2d2::Pool::builder().build(db_manager).unwrap()); 
 
     let subs = Arc::new(RwLock::new(Subs::new())); 
 
@@ -230,8 +254,8 @@ async fn main() {
         .and(warp::ws()) 
         .map(move |ws: warp::ws::Ws| {
             let subs_clone = subs.clone();
-            let db_connection_clone = db_connection.clone();
-            ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone, db_connection_clone)) 
+            let pool_clone = db_pool.clone();
+            ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone, pool_clone)) 
         });
 
     const PORT :u16 = 3030; 
@@ -242,13 +266,13 @@ async fn main() {
 async fn handle_ws_client(
     websocket: WebSocket, 
     subs: Arc<RwLock<Subs>>, 
-    db_connection: Arc<Mutex<PgConnection>>
+    db_pool: DbPool
 ) {
     println!("client connecting");
 
     let (mut sender, mut receiver) = websocket.split();
 
-    send_seven_summits(&mut sender, db_connection.clone()).await;
+    send_seven_summits(&mut sender, db_pool.clone()).await;
 
     let client_id = subs.write().await.add_client(sender);  // maybe wrap sender into arc and access it directly. Locking the whole sub for sending messages is not good. Locking clients individually is what we want to be doing
 
@@ -260,7 +284,11 @@ async fn handle_ws_client(
                 break; 
             }
         }; 
-        handle_ws_message(message, subs.clone(), db_connection.clone(), client_id).await; 
+        let db_pool_clone = db_pool.clone();
+        let subs_clone = subs.clone();
+        tokio::spawn(async move {
+            handle_ws_message(message, subs_clone, db_pool_clone, client_id).await;
+        });
     }
 
     println!("client disconnected") 
@@ -269,7 +297,7 @@ async fn handle_ws_client(
 async fn handle_ws_message(
     message: Message, 
     subs: Arc<RwLock<Subs>>, 
-    db_connection: Arc<Mutex<PgConnection>>,
+    db_pool: DbPool,
     client_id: ClientId
 ) {
     let msg = if let Ok(s) = message.to_str() {
@@ -281,20 +309,18 @@ async fn handle_ws_message(
 
     match serde_json::from_str(msg) {
         Ok(incoming_message) => { 
-            handle_message(incoming_message, subs.clone(), db_connection, client_id).await
+            handle_message(incoming_message, subs.clone(), db_pool, client_id).await
         }, 
         Err(err) => {
             println!("failed to json-parse message. {} {}", msg, err)
         }
     }
-
-    std::thread::sleep(Duration::new(1, 0));
 }
 
 async fn handle_message(
     msg: IncomingMessage,
     subs: Arc<RwLock<Subs>>,
-    db_connection: Arc<Mutex<PgConnection>>,
+    db_pool: DbPool,
     client_id: ClientId
 ) {
     match msg { 
@@ -302,7 +328,7 @@ async fn handle_message(
             println!("client {} subscribing to node {}", client_id, sub.node_id);
             subs.write().await.subscribe(client_id, sub.node_id); 
             // lock client
-            initial_update(client_id, db_connection, sub.node_id, subs.clone()).await;
+            initial_update(client_id, db_pool, sub.node_id, subs.clone()).await;
             // release client
         }, 
         IncomingMessage::NodeDesubscription(desub) => {
@@ -311,11 +337,15 @@ async fn handle_message(
         }, 
         IncomingMessage::NodeCreation(node_creation) => {
             println!("client {} creating node", client_id); 
-            create_node(node_creation, subs, db_connection).await;
+            create_node(node_creation, subs, db_pool).await;
         },        
         IncomingMessage::FlowCreation(flow_creation) => {
             println!("client {} creating flow", client_id); 
-            create_flow(flow_creation, subs, db_connection).await; 
+            create_flow(flow_creation, subs, db_pool).await; 
+        }, 
+        IncomingMessage::NodeRemoval(node_removal) => {
+            println!("client {} removing node", client_id); 
+            remove_node(node_removal, subs, db_pool).await; 
         }
     }
 }
@@ -323,7 +353,7 @@ async fn handle_message(
 async fn create_node(
     node_creation: NodeCreationMessage,
     subs: Arc<RwLock<Subs>>,
-    db_connection: Arc<Mutex<PgConnection>>,
+    db_pool: DbPool,
 ) {
     use schema::nodes::dsl::*; 
 
@@ -332,32 +362,38 @@ async fn create_node(
         title.eq(node_creation.title.clone()),
         notes.eq(node_creation.notes.clone())
     ); 
-    
-    diesel::insert_into(nodes)
-        .values(&new_node)
-        .execute(&*db_connection.lock().await)
-        .unwrap(); 
 
-    let subs_w = subs.read().await; 
+    match db_pool.get() {
+        Ok(connection) => {
+            diesel::insert_into(nodes)
+                .values(&new_node)
+                .execute(&connection).unwrap();
 
-    let clients = subs_w.get_clients_by_node_id(node_creation.id); 
+            let subs_w = subs.read().await; 
 
-    for c in clients {
-        let msg = OutgoingMessage::NodeUpdate(NodeUpdateMessage { 
-            id: node_creation.id, 
-            title: Some(node_creation.title.clone()), 
-            notes: Some(node_creation.notes.clone()), 
-        });
-        let json = serde_json::to_string(&msg).unwrap();
+            let clients = subs_w.get_clients_by_node_id(node_creation.id); 
 
-        c.lock().await.send(Message::text(json)).await.unwrap();
+            for client in clients {
+                let msg = OutgoingMessage::NodeUpdate(NodeUpdateMessage { 
+                    id: node_creation.id, 
+                    title: Some(node_creation.title.clone()), 
+                    notes: Some(node_creation.notes.clone()), 
+                });
+                let json = serde_json::to_string(&msg).unwrap();
+
+                client.lock().await.send(Message::text(json)).await.unwrap();
+            }
+        }, 
+        Err(err) => {
+            println!("could not get db connection from pool. {}", err)
+        }
     }
 }
 
 async fn create_flow(
     flow_creation: FlowCreationMessage,
     subs: Arc<RwLock<Subs>>,
-    db_connection: Arc<Mutex<PgConnection>>,
+    db_pool: DbPool,
 ) {
     use schema::flows::dsl::*; 
 
@@ -368,21 +404,90 @@ async fn create_flow(
         share.eq(flow_creation.share)
     ); 
 
-    let result = diesel::insert_into(flows)
-        .values(&new_flow)
-        .execute(&*db_connection.lock().await); 
+    match db_pool.get() {
+        Ok(connection) => {
+            let result = diesel::insert_into(flows)
+                .values(&new_flow)
+                .execute(&connection); 
 
-    match result {
-        Ok(..) => {
-            send_create_flow_updates(
-                flow_creation, 
-                subs, 
-            ).await
+            match result {
+                Ok(..) => {
+                    send_create_flow_updates(
+                        flow_creation, 
+                        subs, 
+                    ).await
+                }, 
+                Err(err) => {
+                    println!("DB error when creating flow {}", err)
+                }
+            };
         }, 
         Err(err) => {
-            println!("DB error when creating flow {}", err)
+            println!("error getting connection from pool. {}", err)
         }
-    };
+    }
+}
+
+async fn remove_node(
+    node_removal: NodeRemovalMessage,
+    subs: Arc<RwLock<Subs>>,
+    db_pool: DbPool,
+) {
+    use schema::flows::dsl::*; 
+    use schema::nodes::dsl::*; 
+
+    match db_pool.get() {
+        Ok(connection) => {
+            diesel::delete(flows)
+                .filter(from_id.eq(node_removal.node_id).or(
+                        into_id.eq(node_removal.node_id)))
+                .execute(&connection)
+                .unwrap();
+
+            let result = diesel::delete(nodes.find(node_removal.node_id))
+                .execute(&connection);
+
+            match result {
+                Ok(..) => {
+                    let a = async {
+                        let mut subs_w = subs.write().await; 
+                        subs_w.unsubscribe_all_from_node(node_removal.node_id); 
+                    };
+                    let b = async {
+                        let subs_r = subs.read().await; 
+
+                        let mut futures = vec![]; 
+
+                        for client in subs_r.get_clients_by_node_id(node_removal.node_id) {
+                            let future = send_remove_node_message(
+                                node_removal.clone(), 
+                                client.into()
+                            ); 
+                            futures.push(future); 
+                        }
+                        future::join_all(futures).await;
+                    };
+                    future::join(a, b).await; 
+                }, 
+                Err(err) => {
+                    println!("could not delete node, {}", err) 
+                }
+            }
+        }, 
+        Err(err) => {
+            println!("error getting connection from pool. {}", err)
+        }
+    }
+
+}
+
+async fn send_remove_node_message(
+    node_removal: NodeRemovalMessage, 
+    client: Arc<Mutex<Client>>
+) -> Result<(), warp::Error> {
+    let msg = OutgoingMessage::NodeRemoval(node_removal); 
+    let json = serde_json::to_string(&msg).unwrap();
+    client.lock().await.send(Message::text(json)).await
 }
 
 async fn send_create_flow_updates(
@@ -439,7 +544,7 @@ async fn send_create_flow_updates(
 
     let flow_clients = subs_w.get_clients_by_ids(flow_client_ids); 
 
-    for c in flow_clients {
+    for client in flow_clients {
         let msg = OutgoingMessage::FlowUpdate(FlowUpdateMessage { 
             from_id: flow_creation.from_id, 
             into_id: flow_creation.into_id, 
@@ -448,7 +553,7 @@ async fn send_create_flow_updates(
         });
         let json = serde_json::to_string(&msg).unwrap();
 
-        match c.lock().await.send(Message::text(json)).await {
+        match client.lock().await.send(Message::text(json)).await {
             Ok(..) => (), 
             Err(..) => {
                 // remove this client, its connection is probably closed
@@ -461,77 +566,104 @@ async fn send_create_flow_updates(
 
 async fn initial_update(
     client_id: ClientId,
-    db_connection: Arc<Mutex<PgConnection>>,
+    db_pool: DbPool, 
     node_id: NodeId, 
     subs: Arc<RwLock<Subs>>
 ) {
     use schema::nodes::dsl::*; 
-    use schema::flows::dsl::*; 
 
-    let result = nodes.find(node_id)
-        .first::<Node>(&*db_connection.lock().await);
-
-    match result {
-        Ok(node) => {
-            println!("sending initial update for node {}", node.title); 
-            let flows_into = flows.filter(from_id.eq(node_id))
-                .load::<Flow>(&*db_connection.lock().await).unwrap(); 
-            let flows_from = flows.filter(into_id.eq(node_id))
-                .load::<Flow>(&*db_connection.lock().await).unwrap(); 
-            
-            let subs_w = subs.read().await; 
-            
-            let flow_updates = flows_from.iter().chain(flows_into.iter()); 
-
-            match subs_w.get_client(client_id) {
-                Some(c) => {
-                    let msg = OutgoingMessage::NodeUpdate(NodeUpdateMessage {
-                        id: node.id, 
-                        title: Some(node.title), 
-                        notes: Some(node.notes),
-                    });
-                    let json = serde_json::to_string(&msg).unwrap();
-
-                    c.lock().await.send(Message::text(json)).await.unwrap();
-
-                    for flow in flow_updates {
-                        let msg = OutgoingMessage::FlowUpdate(FlowUpdateMessage {
-                            from_id: flow.from_id, 
-                            into_id: flow.into_id, 
-                            notes: Some(flow.notes.clone()), 
-                            share: Some(flow.share)
-                        }); 
-                        let txt = serde_json::to_string(&msg).unwrap();
-                        c.lock().await.send(Message::text(txt)).await.unwrap();
-                    }
+    match db_pool.get() {
+        Ok(connection) => {
+            let result = nodes.find(node_id)
+                .first::<Node>(&connection);
+            match result {
+                Ok(node) => {
+                    send_initial_updates(
+                        node, 
+                        client_id, 
+                        connection, 
+                        subs
+                    ).await; 
                 }, 
-                None => {
-                    println!("client does not exists") 
+                Err(err) => {
+                    println!("could not find node {} in db: {}", node_id, err); 
                 }
             }
-
         }, 
         Err(err) => {
-            println!("could not find node {} in db: {}", node_id, err); 
+            println!("could not get db connection from pool. {}", err)
         }
     }
 }
 
-async fn send_seven_summits(sender: &mut Client, db_connection: Arc<Mutex<PgConnection>>) {
+async fn send_initial_updates(
+    node: Node, 
+    client_id: ClientId, 
+    connection: r2d2::PooledConnection<ConnectionManager<PgConnection>>, 
+    subs: Arc<RwLock<Subs>>
+) {
+    use schema::flows::dsl::*; 
+
+    println!("sending initial update for node {}", node.title); 
+    let flows_into = flows.filter(from_id.eq(node.id))
+        .load::<Flow>(&connection).unwrap(); 
+    let flows_from = flows.filter(into_id.eq(node.id))
+        .load::<Flow>(&connection).unwrap(); 
+    
+    let subs_w = subs.read().await; 
+    
+    let flow_updates = flows_from.iter().chain(flows_into.iter()); 
+
+    match subs_w.get_client(client_id) {
+        Some(c) => {
+            let msg = OutgoingMessage::NodeUpdate(NodeUpdateMessage {
+                id: node.id, 
+                title: Some(node.title), 
+                notes: Some(node.notes),
+            });
+            let json = serde_json::to_string(&msg).unwrap();
+
+            c.lock().await.send(Message::text(json)).await.unwrap();
+
+            for flow in flow_updates {
+                let msg = OutgoingMessage::FlowUpdate(FlowUpdateMessage {
+                    from_id: flow.from_id, 
+                    into_id: flow.into_id, 
+                    notes: Some(flow.notes.clone()), 
+                    share: Some(flow.share)
+                }); 
+                let txt = serde_json::to_string(&msg).unwrap();
+                c.lock().await.send(Message::text(txt)).await.unwrap();
+            }
+        }, 
+        None => {
+            println!("client does not exists") 
+        }
+    }
+}
+
+async fn send_seven_summits(sender: &mut Client, db_pool: DbPool) {
     use schema::nodes::dsl::*; 
 
-    let result = nodes.limit(7).load::<Node>(&*db_connection.lock().await); 
+    match db_pool.get() {
+        Ok(connection) => {
+            let result = nodes.limit(7).load::<Node>(&connection); 
 
-    match result {
-        Ok(rows) => {
-            let msg = OutgoingMessage::SevenSummits(SevenSummitsMessage {
-                node_ids: rows.iter().map(|n| n.id).collect()
-            }); 
-            let txt = serde_json::to_string(&msg).unwrap(); 
-            sender.send(Message::text(txt)).await.unwrap();
+            match result {
+                Ok(rows) => {
+                    let msg = OutgoingMessage::SevenSummits(SevenSummitsMessage {
+                        node_ids: rows.iter().map(|n| n.id).collect()
+                    }); 
+                    let txt = serde_json::to_string(&msg).unwrap(); 
+                    sender.send(Message::text(txt)).await.unwrap();
+                }, 
+                Err(err) => {
+                    println!("faild to get 7 summits from db:{}", err) 
+                }
+            }
         }, 
         Err(err) => {
-            println!("faild to get 7 summits from db:{}", err) 
+            println!("could not get db connection from pool. {}", err)
         }
     }
 }

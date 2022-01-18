@@ -15,6 +15,6 @@ serde_json = "1.0.72"
 tokio = {version = "1.14.0", features = ["full"]}
 uuid = {version = "0.8.2", features = ["serde"]}
 warp = "0.3.2"
-diesel = { version = "1.4.4", features = ["postgres", "uuidv07"] }
+diesel = { version = "1.4.4", features = ["postgres", "uuidv07", "r2d2"] }
 dotenv = "0.15.0"
 serde_with = "1.11.0"
