@@ -1,7 +1,6 @@
 /** This is a server for summits. 
- * It allows for subscribing for 
- *  - summit-ids and 
- *  - connections
+ * It allows clients to subscribe to node updates. 
+ * And it will also aggregate state from the near blockchain. 
  */
 
 use futures; 
@@ -449,11 +448,7 @@ async fn remove_node(
 
             match result {
                 Ok(..) => {
-                    let a = async {
-                        let mut subs_w = subs.write().await; 
-                        subs_w.unsubscribe_all_from_node(node_removal.node_id); 
-                    };
-                    let b = async {
+                    {
                         let subs_r = subs.read().await; 
 
                         let mut futures = vec![]; 
@@ -466,8 +461,11 @@ async fn remove_node(
                             futures.push(future); 
                         }
                         future::join_all(futures).await;
-                    };
-                    future::join(a, b).await; 
+                    }
+                    {
+                        let mut subs_w = subs.write().await; 
+                        subs_w.unsubscribe_all_from_node(node_removal.node_id); 
+                    }
                 }, 
                 Err(err) => {
                     println!("could not delete node, {}", err) 
@@ -486,6 +484,7 @@ async fn send_remove_node_message(
     client: Arc<Mutex<Client>>
 ) -> Result<(), warp::Error> {
     let msg = OutgoingMessage::NodeRemoval(node_removal); 
+    println!("sending node removal to client") ;
     let json = serde_json::to_string(&msg).unwrap();
     client.lock().await.send(Message::text(json)).await
 }
