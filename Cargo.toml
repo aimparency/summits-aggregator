@@ -1,20 +1,33 @@
 [package]
-name = "aggregator"
+name = "summits-aggregator"
 version = "0.1.0"
-edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors = ["Felix Niemeyer<niemeyer.felix@gmail.com>"]
+publish = false
+# Please update rust-toolchain.toml as well when changing version here:
+rust-version = "1.56.0"
+edition = "2021"
 
 [dependencies]
+actix = "=0.11.0-beta.2"
+clap = "3.0.0-beta.1"
+openssl-probe = "0.1.2"
+serde_json = "1.0.55"
+tokio = { version = "1.1", features = ["full"] }
+tracing = "0.1.13"
+tracing-subscriber = "0.2.4"
+anyhow = "1.0"
+
+
 futures = "0.3.18"
 futures-util = "0.3.18"
 pretty_env_logger = "0.4.0"
 rand = "0.8.4"
 serde = {version = "1.0.130", features = ["derive"]}
-serde_json = "1.0.72"
-tokio = {version = "1.14.0", features = ["full"]}
+
 uuid = {version = "0.8.2", features = ["serde"]}
 warp = "0.3.2"
 diesel = { version = "1.4.4", features = ["postgres", "uuidv07", "r2d2"] }
 dotenv = "0.15.0"
 serde_with = "1.11.0"
+
+near-indexer = { path = "../../../chain/indexer" }

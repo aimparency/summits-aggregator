@@ -6,12 +6,16 @@
 use futures; 
 use futures::{future, SinkExt, StreamExt, stream::SplitSink};
 
+use tracing::info;
 use warp::filters::ws::{Message, WebSocket};
 use warp::Filter;
 
 use std::sync::Arc; 
-use tokio::sync::RwLock; 
-use tokio::sync::Mutex; 
+use tokio::sync::{
+    RwLock,
+    Mutex,
+    mpsc
+};
 
 use std::collections::HashMap; 
 
@@ -33,6 +37,15 @@ use diesel::pg::PgConnection;
 use diesel::r2d2::{self, ConnectionManager}; 
 
 use std::env; 
+
+// NEAR indexer node deps
+use anyhow::Result;
+use clap::Clap; 
+
+use configs::{init_logging, Opts, SubCommand};
+
+mod configs;
+
 
 type ClientId = u128; 
 
@@ -94,20 +107,8 @@ struct SevenSummitsMessage {
 #[derive(Serialize, Debug)] 
 struct NodeUpdateMessage {
     id: NodeId, 
-    // info
     title: Option<String>, 
     notes: Option<String>, 
-    // geometry
-    // x: Option<f64>, // is there a derive, that makes everything an Option? Apply to all node field structs
-    // y: Option<f64>, 
-    // r: Option<f64>
-    // flows
-    // flows_from: Option<Vec<NodeId>>, 
-    // flows_into: Option<Vec<NodeId>>, 
-    // flows_from_additions: Option<Vec<NodeId>>, 
-    // flows_into_additions: Option<Vec<NodeId>>
-    // roles
-    // roles: Option<Vec<NodeRole>>
 }
 
 #[skip_serializing_none]
@@ -236,61 +237,117 @@ impl Subs {
     }
 }
 
+async fn listen_blocks(mut stream: mpsc::Receiver<near_indexer::StreamerMessage>) {
+    while let Some(streamer_message) = stream.recv().await {
+        info!(
+            target: "indexer_example",
+            "#{} {} Shards: {}, Transactions: {}, Receipts: {}, ExecutionOutcomes: {}",
+            streamer_message.block.header.height,
+            streamer_message.block.header.hash,
+            streamer_message.shards.len(),
+            streamer_message.shards.iter().map(|shard| 
+                if let Some(chunk) = &shard.chunk { 
+                    chunk.transactions.len() 
+                } else { 
+                    0usize 
+                }
+            ).sum::<usize>(),
+            streamer_message.shards.iter().map(|shard| 
+                if let Some(chunk) = &shard.chunk {
+                    chunk.receipts.len() 
+                } else { 
+                    0usize 
+                }
+            ).sum::<usize>(),
+            streamer_message.shards.iter().map(|shard| shard.receipt_execution_outcomes.len()).sum::<usize>(),
+        );
+    }
+}
+
 type DbPool = Arc<r2d2::Pool<ConnectionManager<PgConnection>>>;
 
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().ok(); 
 
-    println!("establishing connection to db"); 
-    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env");
-    let db_manager = ConnectionManager::<PgConnection>::new(&db_url);
-    let db_pool = Arc::new(r2d2::Pool::builder().build(db_manager).unwrap()); 
+    openssl_probe::init_ssl_cert_env_vars();
+    init_logging();
 
-    let subs = Arc::new(RwLock::new(Subs::new())); 
+    let opts: Opts = Opts::parse();
 
-    let routes = warp::path("v1")
-        .and(warp::ws()) 
-        .map(move |ws: warp::ws::Ws| {
-            let subs_clone = subs.clone();
-            let pool_clone = db_pool.clone();
-            ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone, pool_clone)) 
-        });
+    let home_dir =
+        opts.home_dir.unwrap_or(std::path::PathBuf::from(near_indexer::get_default_home()));
 
-    const PORT :u16 = 3030; 
-    println!("about to serve on port {}", PORT); 
-    warp::serve(routes).run(([127, 0, 0, 1], PORT)).await;
+    match opts.subcmd {
+        SubCommand::Run(args) => {
+            println!("debug level {}", args.debug_level); 
+            println!("establishing connection to db"); 
+            let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env");
+            let db_manager = ConnectionManager::<PgConnection>::new(&db_url);
+            let db_pool = Arc::new(r2d2::Pool::builder().build(db_manager).unwrap()); 
+
+            let subs = Arc::new(RwLock::new(Subs::new())); 
+
+            let routes = warp::path("v1")
+                .and(warp::ws()) 
+                .map(move |ws: warp::ws::Ws| {
+                    let subs_clone = subs.clone();
+                    let pool_clone = db_pool.clone();
+                    ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone, pool_clone)) 
+                });
+
+            const PORT :u16 = 3030; 
+            println!("about to serve on port {}", PORT); 
+            warp::serve(routes).run(([127, 0, 0, 1], PORT)).await;
+
+            let indexer_config = near_indexer::IndexerConfig {
+                home_dir,
+                sync_mode: near_indexer::SyncModeEnum::LatestSynced,
+                await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::WaitForFullSync,
+            };
+            let system = actix::System::new();
+            system.block_on(async move {
+                let indexer = near_indexer::Indexer::new(indexer_config).expect("Indexer::new()");
+                let stream = indexer.streamer();
+                actix::spawn(listen_blocks(stream));
+            });
+            system.run().unwrap();
+        }, 
+        SubCommand::Init(config) => {
+            near_indexer::indexer_init_configs(&home_dir, config.into()).unwrap(); 
+        }
+    }
 }
 
 async fn handle_ws_client(
     websocket: WebSocket, 
     subs: Arc<RwLock<Subs>>, 
     db_pool: DbPool
-) {
-    println!("client connecting");
+) -> () {
+    tokio::spawn(async move {
+        println!("client connecting");
 
-    let (mut sender, mut receiver) = websocket.split();
+        let (mut sender, mut receiver) = websocket.split();
 
-    send_seven_summits(&mut sender, db_pool.clone()).await;
+        send_seven_summits(&mut sender, db_pool.clone()).await;
 
-    let client_id = subs.write().await.add_client(sender);  // maybe wrap sender into arc and access it directly. Locking the whole sub for sending messages is not good. Locking clients individually is what we want to be doing
+        let client_id = subs.write().await.add_client(sender);  // maybe wrap sender into arc and access it directly. Locking the whole sub for sending messages is not good. Locking clients individually is what we want to be doing
 
-    while let Some(body) = receiver.next().await {
-        let message = match body {
-            Ok(msg) => msg, 
-            Err(e) => {
-                println!("error reading msg on websocket: {}", e); 
-                break; 
-            }
-        }; 
-        let db_pool_clone = db_pool.clone();
-        let subs_clone = subs.clone();
-        tokio::spawn(async move {
+        while let Some(body) = receiver.next().await {
+            let message = match body {
+                Ok(msg) => msg, 
+                Err(e) => {
+                    println!("error reading msg on websocket: {}", e); 
+                    break; 
+                }
+            }; 
+            let db_pool_clone = db_pool.clone();
+            let subs_clone = subs.clone();
             handle_ws_message(message, subs_clone, db_pool_clone, client_id).await;
-        });
-    }
+        }
 
-    println!("client disconnected") 
+        println!("client disconnected") 
+    });
 }
 
 async fn handle_ws_message(
