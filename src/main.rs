@@ -266,8 +266,7 @@ async fn listen_blocks(mut stream: mpsc::Receiver<near_indexer::StreamerMessage>
 
 type DbPool = Arc<r2d2::Pool<ConnectionManager<PgConnection>>>;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     dotenv::dotenv().ok(); 
 
     openssl_probe::init_ssl_cert_env_vars();
@@ -281,6 +280,8 @@ async fn main() {
     match opts.subcmd {
         SubCommand::Run(args) => {
             println!("debug level {}", args.debug_level); 
+
+            // prepare aggregator 
             println!("establishing connection to db"); 
             let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env");
             let db_manager = ConnectionManager::<PgConnection>::new(&db_url);
@@ -288,30 +289,39 @@ async fn main() {
 
             let subs = Arc::new(RwLock::new(Subs::new())); 
 
-            let routes = warp::path("v1")
-                .and(warp::ws()) 
-                .map(move |ws: warp::ws::Ws| {
-                    let subs_clone = subs.clone();
-                    let pool_clone = db_pool.clone();
-                    ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone, pool_clone)) 
-                });
 
-            const PORT :u16 = 3030; 
-            println!("about to serve on port {}", PORT); 
-            warp::serve(routes).run(([127, 0, 0, 1], PORT)).await;
+            const PORT :u16 = 3031; 
 
+
+            // prepare indexer
             let indexer_config = near_indexer::IndexerConfig {
                 home_dir,
                 sync_mode: near_indexer::SyncModeEnum::LatestSynced,
                 await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::WaitForFullSync,
             };
-            let system = actix::System::new();
-            system.block_on(async move {
+
+
+            // run in parallel 
+            let sys = actix::System::new(); 
+            sys.block_on(async move {
+                // run aggregator
+                let routes = warp::path("v1")
+                    .and(warp::ws()) 
+                    .map(move |ws: warp::ws::Ws| {
+                        let subs_clone = subs.clone();
+                        let pool_clone = db_pool.clone();
+                        ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone, pool_clone)) 
+                    });
+                println!("about to serve on port {}", PORT); 
+                actix::spawn(warp::serve(routes).run(([127, 0, 0, 1], PORT)));
+
+                // run indexer
+                println!("running indexer"); 
                 let indexer = near_indexer::Indexer::new(indexer_config).expect("Indexer::new()");
                 let stream = indexer.streamer();
                 actix::spawn(listen_blocks(stream));
             });
-            system.run().unwrap();
+            sys.run().unwrap(); 
         }, 
         SubCommand::Init(config) => {
             near_indexer::indexer_init_configs(&home_dir, config.into()).unwrap(); 
@@ -346,7 +356,7 @@ async fn handle_ws_client(
             handle_ws_message(message, subs_clone, db_pool_clone, client_id).await;
         }
 
-        println!("client disconnected") 
+        println!("client disconnected"); 
     });
 }
 
