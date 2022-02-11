@@ -25,9 +25,13 @@ pub(crate) enum SubCommand {
 
 #[derive(Clap, Debug)]
 pub(crate) struct RunArgs {
-    /// chain/network id (localnet, testnet, devnet, betanet)
-    #[clap(short, long, default_value = "debug")]
-    pub debug_level: String,
+    /// indexer debug level. 0: quiet ... 4: debug ... 9: verbose 
+    #[clap(short, long, default_value = "0")]
+    pub indexer_debug_level: u8,
+    /// wss debug level. 0: quiet ... 4: debug ... 9: verbose 
+    #[clap(short, long, default_value = "9")]
+    pub wss_debug_level: u8 
+
 }
 
 #[derive(Clap, Debug)]

@@ -4,11 +4,12 @@ version = "0.1.0"
 authors = ["Felix Niemeyer<niemeyer.felix@gmail.com>"]
 publish = false
 # Please update rust-toolchain.toml as well when changing version here:
-rust-version = "1.56.0"
+rust-version = "1.58.1"
 edition = "2021"
 
 [dependencies]
 actix = "=0.11.0-beta.2"
+actix-web = "=4.0.0-beta.6"
 clap = "3.0.0-beta.1"
 openssl-probe = "0.1.2"
 serde_json = "1.0.55"

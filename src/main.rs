@@ -7,8 +7,8 @@ use futures;
 use futures::{future, SinkExt, StreamExt, stream::SplitSink};
 
 use tracing::info;
-use warp::filters::ws::{Message, WebSocket};
-use warp::Filter;
+use warp::filters::ws::{Message, WebSocket}; 
+use warp::Filter; 
 
 use std::sync::Arc; 
 use tokio::sync::{
@@ -37,6 +37,10 @@ use diesel::pg::PgConnection;
 use diesel::r2d2::{self, ConnectionManager}; 
 
 use std::env; 
+
+// use actix::prelude::*;
+// use actix_web::{middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer};
+// use actix_web_actors::ws;
 
 // NEAR indexer node deps
 use anyhow::Result;
@@ -237,30 +241,37 @@ impl Subs {
     }
 }
 
-async fn listen_blocks(mut stream: mpsc::Receiver<near_indexer::StreamerMessage>) {
+async fn listen_blocks(
+    mut stream: mpsc::Receiver<near_indexer::StreamerMessage>, 
+    debug_level: u8
+) {
     while let Some(streamer_message) = stream.recv().await {
-        info!(
-            target: "indexer_example",
-            "#{} {} Shards: {}, Transactions: {}, Receipts: {}, ExecutionOutcomes: {}",
-            streamer_message.block.header.height,
-            streamer_message.block.header.hash,
-            streamer_message.shards.len(),
-            streamer_message.shards.iter().map(|shard| 
-                if let Some(chunk) = &shard.chunk { 
-                    chunk.transactions.len() 
-                } else { 
-                    0usize 
-                }
-            ).sum::<usize>(),
-            streamer_message.shards.iter().map(|shard| 
-                if let Some(chunk) = &shard.chunk {
-                    chunk.receipts.len() 
-                } else { 
-                    0usize 
-                }
-            ).sum::<usize>(),
-            streamer_message.shards.iter().map(|shard| shard.receipt_execution_outcomes.len()).sum::<usize>(),
-        );
+        if debug_level > 3 {
+            info!(
+                target: "indexer_example",
+                "#{} {} Shards: {}, Transactions: {}, Receipts: {}, ExecutionOutcomes: {}",
+                streamer_message.block.header.height,
+                streamer_message.block.header.hash,
+                streamer_message.shards.len(),
+                streamer_message.shards.iter().map(|shard| 
+                    if let Some(chunk) = &shard.chunk { 
+                        chunk.transactions.len() 
+                    } else { 
+                        0usize 
+                    }
+                ).sum::<usize>(),
+                streamer_message.shards.iter().map(|shard| 
+                    if let Some(chunk) = &shard.chunk {
+                        chunk.receipts.len() 
+                    } else { 
+                        0usize 
+                    }
+                ).sum::<usize>(),
+                streamer_message.shards.iter().map(
+                    |shard| shard.receipt_execution_outcomes.len()
+                ).sum::<usize>(),
+            );
+        }
     }
 }
 
@@ -279,9 +290,9 @@ fn main() {
 
     match opts.subcmd {
         SubCommand::Run(args) => {
-            println!("debug level {}", args.debug_level); 
+            println!("debug level {}", args.indexer_debug_level); 
 
-            // prepare aggregator 
+            // prepare wss 
             println!("establishing connection to db"); 
             let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env");
             let db_manager = ConnectionManager::<PgConnection>::new(&db_url);
@@ -304,7 +315,7 @@ fn main() {
             // run in parallel 
             let sys = actix::System::new(); 
             sys.block_on(async move {
-                // run aggregator
+                // run wss 
                 let routes = warp::path("v1")
                     .and(warp::ws()) 
                     .map(move |ws: warp::ws::Ws| {
@@ -313,13 +324,13 @@ fn main() {
                         ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone, pool_clone)) 
                     });
                 println!("about to serve on port {}", PORT); 
-                actix::spawn(warp::serve(routes).run(([127, 0, 0, 1], PORT)));
+                actix::spawn(warp::serve(routes.boxed()).run(([127, 0, 0, 1], PORT)));
 
                 // run indexer
                 println!("running indexer"); 
                 let indexer = near_indexer::Indexer::new(indexer_config).expect("Indexer::new()");
                 let stream = indexer.streamer();
-                actix::spawn(listen_blocks(stream));
+                actix::spawn(listen_blocks(stream, args.indexer_debug_level));
             });
             sys.run().unwrap(); 
         }, 
