@@ -1,7 +1,6 @@
 use diesel::Queryable;
-use uuid::Uuid; 
 
-pub type NodeId = Uuid;
+use crate::types::NodeId;
 
 #[derive(Queryable)]
 pub struct Node {
