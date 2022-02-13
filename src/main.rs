@@ -9,6 +9,8 @@ use std::sync::Arc;
 extern crate diesel; 
 use dotenv; 
 
+use env_logger; 
+
 use diesel::pg::PgConnection;
 
 use diesel::r2d2::{self, ConnectionManager}; 
@@ -16,7 +18,7 @@ use diesel::r2d2::{self, ConnectionManager};
 use std::env; 
 
 use actix::prelude::*;
-use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer};
 
 mod actix_web_actors;
 use actix_web_actors::ws;
@@ -46,8 +48,7 @@ async fn ws_index(
     stream: web::Payload, 
     server: web::Data<Addr<wsserver::SummitsServer>>,
 ) -> Result<HttpResponse, Error> {
-    println!("{:?}", r);
-    let res = ws::start(
+    ws::start(
         wssession::SummitsSession {
             id: 0, 
             hb: Instant::now(), 
@@ -55,17 +56,17 @@ async fn ws_index(
         }, 
         &r, 
         stream
-    );
-    println!("{:?}", res);
-    res
+    )
 }
 
 
 fn main() {
+    env_logger::init();
     dotenv::dotenv().ok(); 
 
-    openssl_probe::init_ssl_cert_env_vars();
-    init_logging();
+    // openssl_probe::init_ssl_cert_env_vars();
+    //
+    // init_logging();
 
     let opts: Opts = Opts::parse();
 
@@ -74,10 +75,7 @@ fn main() {
 
     match opts.subcmd {
         SubCommand::Run(args) => {
-            println!("debug level {}", args.indexer_debug_level); 
-
             // prepare wss 
-            println!("establishing connection to db"); 
             let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env");
             let db_manager = ConnectionManager::<PgConnection>::new(&db_url);
             let db_pool = Arc::new(r2d2::Pool::builder().build(db_manager).unwrap()); 
@@ -93,6 +91,7 @@ fn main() {
             // run in parallel 
             let sys = actix::System::new(); 
             sys.block_on(async move {
+
                 // run wss 
                 let sserver = Arc::new(wsserver::SummitsServer::new().start()); 
                 let sserver_clone = sserver.clone();
@@ -100,33 +99,26 @@ fn main() {
                 HttpServer::new(move || {
                     App::new()
                         .app_data(sserver_clone.clone())
-                        .service(web::resource("/v1").route(web::get().to(ws_index)))
+                        .wrap(middleware::Logger::default())
+                        .wrap(middleware::Logger::new("%a %{User-Agent}i"))
+                        .service(web::resource("/v1/").to(ws_index))
                 })
                 .bind("127.0.0.1:3031").unwrap()
                 .run();
 
-                // let routes = warp::path("v1")
-                //     .and(warp::ws()) 
-                //     .map(move |ws: warp::ws::Ws| {
-                //         let subs_clone = subs.clone();
-                //         let pool_clone = db_pool.clone();
-                //         ws.on_upgrade(move |socket| handle_ws_client(socket, subs_clone, pool_clone)) 
-                //     });
-                // println!("about to serve on port {}", PORT); 
-                // actix::spawn(warp::serve(routes.boxed()).run(([127, 0, 0, 1], PORT)));
 
                 // run indexer
-                println!("running indexer"); 
-                let indexer = near_indexer::Indexer::new(indexer_config).expect("Indexer::new()");
-                let stream = indexer.streamer(); 
+                // println!("running indexer"); 
+                // let indexer = near_indexer::Indexer::new(indexer_config).expect("Indexer::new()");
+                // let stream = indexer.streamer(); 
 
-                actix::spawn(
-                    listener::listen(
-                        stream, 
-                        sserver, 
-                        args.indexer_debug_level
-                    )
-                )
+                // actix::spawn(
+                //     listener::listen(
+                //         stream, 
+                //         sserver, 
+                //         args.indexer_debug_level
+                //     )
+                // )
             });
 
             sys.run().unwrap(); 
