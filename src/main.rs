@@ -18,7 +18,7 @@ use diesel::r2d2::{self, ConnectionManager};
 use std::env; 
 
 use actix::prelude::*;
-use actix_web::{middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder};
 
 mod actix_web_actors;
 use actix_web_actors::ws;
@@ -41,12 +41,12 @@ mod schema;
 mod types; 
 mod models; 
 
-type DbPool = Arc<r2d2::Pool<ConnectionManager<PgConnection>>>;
+// type DbPool = Arc<r2d2::Pool<ConnectionManager<PgConnection>>>;
 
 async fn ws_index(
     r: HttpRequest,
     stream: web::Payload, 
-    server: web::Data<Addr<wsserver::SummitsServer>>,
+    server: web::Data<Addr<wsserver::SummitsServer>>
 ) -> Result<HttpResponse, Error> {
     ws::start(
         wssession::SummitsSession {
@@ -57,6 +57,10 @@ async fn ws_index(
         &r, 
         stream
     )
+}
+
+async fn test(server: web::Data<Addr<wsserver::SummitsServer>>) -> impl Responder {
+    format!("hey, this works {:?}", server.get_ref().connected()) 
 }
 
 
@@ -74,14 +78,14 @@ fn main() {
         opts.home_dir.unwrap_or(std::path::PathBuf::from(near_indexer::get_default_home()));
 
     match opts.subcmd {
-        SubCommand::Run(args) => {
+        SubCommand::Run(_args) => {
             // prepare wss 
             let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env");
             let db_manager = ConnectionManager::<PgConnection>::new(&db_url);
-            let db_pool = Arc::new(r2d2::Pool::builder().build(db_manager).unwrap()); 
+            let _db_pool = Arc::new(r2d2::Pool::builder().build(db_manager).unwrap()); 
 
             // prepare indexer
-            let indexer_config = near_indexer::IndexerConfig {
+            let _indexer_config = near_indexer::IndexerConfig {
                 home_dir,
                 sync_mode: near_indexer::SyncModeEnum::LatestSynced,
                 await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::WaitForFullSync,
@@ -93,19 +97,18 @@ fn main() {
             sys.block_on(async move {
 
                 // run wss 
-                let sserver = Arc::new(wsserver::SummitsServer::new().start()); 
-                let sserver_clone = sserver.clone();
+                let sserver = wsserver::SummitsServer::new().start(); 
 
                 HttpServer::new(move || {
                     App::new()
-                        .app_data(sserver_clone.clone())
                         .wrap(middleware::Logger::default())
                         .wrap(middleware::Logger::new("%a %{User-Agent}i"))
-                        .service(web::resource("/v1/").to(ws_index))
+                        .data(sserver.clone())
+                        .route("/test", web::get().to(test))
+                        .service(web::resource("/v1").to(ws_index))
                 })
                 .bind("127.0.0.1:3031").unwrap()
                 .run();
-
 
                 // run indexer
                 // println!("running indexer"); 
